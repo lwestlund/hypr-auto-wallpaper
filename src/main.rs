@@ -1,141 +1,116 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{io::Read, str::FromStr, time::Duration};
 
+use anyhow::anyhow;
 use chrono::{Local, NaiveTime};
-use hyprland::hyprpaper;
+use hyprland::hyprpaper::{self, hyprpaper_async};
 use tokio::time;
-
-const MORNING: NaiveTime = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
-const DAY: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
-const EVENING: NaiveTime = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
-const NIGHT: NaiveTime = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
-
-const DEFAULT_WALLPAPER_DIR: &str = "~/Pictures/wallpapers";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let wallpaper_dir: PathBuf = std::env::var("WALLPAPER_DIR")
-        .unwrap_or_else(|err| {
-            eprintln!("No WALLPAPER_DIR env var set, using default {DEFAULT_WALLPAPER_DIR}");
-            DEFAULT_WALLPAPER_DIR.to_string()
-        })
-        .into();
+    let entries = parse_wallpaper_config()?;
 
-    // let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("No XDG_RUNTIME_DIR set");
-    // let instance_signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-    //     .expect("Could not get HYPRLAND_INSTANCE_SIGNATURE");
-    // let hyprland_socket: PathBuf = [
-    //     xdg_runtime_dir,
-    //     "hypr".into(),
-    //     instance_signature,
-    //     ".socket.sock".into(),
-    // ]
-    // .into_iter()
-    // .collect();
-    // let mut socket = UnixStream::connect(&hyprland_socket).await?;
+    let mut current_wallpaper: Option<&String> = None;
 
-    // TODO(lovew): Increase this to something bigger or get from env.
-    let mut interval = time::interval(Duration::from_secs(5));
+    // TODO(lovew): Get from config or a default value as fallback.
+    const EVAL_PERIOD: Duration = Duration::from_secs(60 * 5);
+
+    let mut interval = time::interval(EVAL_PERIOD);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
 
         let now = Local::now().time();
         println!("now {now}");
-        let (old, new) = if now < MORNING {
-            println!("now < morning => night");
-            (TimeOfDay::Evening, TimeOfDay::Night)
-        } else if now < DAY {
-            println!("now < day => morning");
-            (TimeOfDay::Night, TimeOfDay::Morning)
-        } else if now < EVENING {
-            println!("now < evening => day");
-            (TimeOfDay::Morning, TimeOfDay::Day)
-        } else if now < NIGHT {
-            println!("now < night => evening");
-            (TimeOfDay::Day, TimeOfDay::Evening)
+        let new_wallpaper = entries
+            .iter()
+            .cycle()
+            .find_map(|e| {
+                if now < e.time {
+                    Some(&e.wallpaper)
+                } else {
+                    None
+                }
+            })
+            .expect("Did not find a wallpaper to display at {now}");
+
+        if matches!(current_wallpaper, Some(current_wallpaper) if current_wallpaper == new_wallpaper)
+        {
+            // Wallpaper should already be the correct one, keep on ticking.
         } else {
-            println!("else => night");
-            (TimeOfDay::Evening, TimeOfDay::Night)
-        };
-
-        let wallpaper = new.as_path();
-        println!("wallpaper: {}", wallpaper.display());
-        let wallpaper_path = {
-            let mut dir = wallpaper_dir.clone();
-            dir.push(wallpaper);
-            dir
-        };
-
-        // preload
-        preload(&wallpaper_path).await?;
-
-        // wallpaper
-        set_wallpaper(&wallpaper_path).await?;
-
-        // unload
-        let old_wallpaper = old.as_path();
-        println!("old: {}", old_wallpaper.display());
-        let wallpaper_path = {
-            let mut dir = wallpaper_dir.clone();
-            dir.push(old_wallpaper);
-            dir
-        };
-        if let Err(err) = unload_wallpaper(&wallpaper_path).await {
-            eprintln!("Failed to unload {} ({})", wallpaper_path.display(), err);
+            println!("reloading with {new_wallpaper}");
+            reload(new_wallpaper).await?;
+            current_wallpaper = Some(new_wallpaper);
         }
 
-        // TODO(lovew): Signal handling, listen to SIGTERM.
+        // TODO(lovew): Signal handling, listen to SIGTERM?
     }
 }
 
-#[derive(Clone, Copy)]
-enum TimeOfDay {
-    Night,
-    Morning,
-    Day,
-    Evening,
-}
-
-impl TimeOfDay {
-    fn as_path(&self) -> &Path {
-        let p = match self {
-            Self::Night => "big-sur-mountains-night-6016x6016.jpg",
-            Self::Morning => "big-sur-mountains-morning-6016x6016.jpg",
-            Self::Day => "big-sur-mountains-day-6016x6016.jpg",
-            Self::Evening => "big-sur-mountains-evening-6016x6016.jpg",
-        };
-        Path::new(p)
-    }
-}
-
-async fn preload(path: &Path) -> anyhow::Result<()> {
-    let preload = hyprpaper::Preload {
-        path: path.to_owned(),
+fn parse_wallpaper_config() -> anyhow::Result<Vec<Entry>> {
+    let mut config_file = {
+        let xdg_dirs = xdg::BaseDirectories::with_prefix("hypr").unwrap();
+        let config = xdg_dirs.get_config_file("auto-wallpaper.conf");
+        std::fs::File::open(config)?
     };
-    let command = hyprpaper::Command::Preload(preload);
-    hyprland::hyprpaper::hyprpaper_async(command).await?;
-    Ok(())
+    let mut contents = {
+        let size = config_file
+            .metadata()
+            .map(|m| m.len() as usize)
+            .unwrap_or_default();
+        String::with_capacity(size)
+    };
+    config_file.read_to_string(&mut contents)?;
+
+    let mut entries: Vec<Entry> = contents
+        .lines()
+        .map(|line| line.parse())
+        .collect::<Result<_, _>>()?;
+    entries.sort();
+
+    Ok(entries)
 }
 
-async fn set_wallpaper(path: &Path) -> anyhow::Result<()> {
-    let wallpaper = hyprpaper::Wallpaper {
+#[derive(Debug, PartialEq, Eq)]
+struct Entry {
+    time: NaiveTime,
+    wallpaper: String,
+}
+
+impl FromStr for Entry {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (time, wallpaper) = s
+            .split_once('=')
+            .ok_or(anyhow!("Failed to parse entry from '{s}'"))?;
+        let time = time.trim();
+        let time = NaiveTime::parse_from_str(time, "%H:%M")
+            .or_else(|_parse_error| NaiveTime::parse_from_str(time, "%H:%M:%S"))?;
+
+        let wallpaper = wallpaper.trim().to_owned();
+
+        Ok(Self { time, wallpaper })
+    }
+}
+
+impl PartialOrd for Entry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Entry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time.cmp(&other.time)
+    }
+}
+
+async fn reload(path: &str) -> anyhow::Result<()> {
+    let reload = hyprpaper::Keyword::Reload(hyprpaper::Reload {
         monitor: None,
         mode: None,
         path: path.to_owned(),
-    };
-    let command = hyprpaper::Command::Wallpaper(wallpaper);
-    hyprpaper::hyprpaper_async(command).await?;
+    });
+    hyprpaper_async(reload).await?;
     Ok(())
 }
-
-async fn unload_wallpaper(path: &Path) -> anyhow::Result<()> {
-    let unload = hyprpaper::Unload::Path(path.to_owned());
-    let command = hyprpaper::Command::Unload(unload);
-    hyprpaper::hyprpaper_async(command).await?;
-    Ok(())
-}
-
-async fn auto_wallpaper() {}
